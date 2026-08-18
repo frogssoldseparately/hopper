@@ -7,25 +7,6 @@ import (
 	"strings"
 )
 
-var patternIdMapping = map[string]int{
-	"leftBrace":  0,
-	"rightBrace": 1,
-	"equals":     2,
-	"colon":      3,
-	"pipe":       4,
-	"ident":      5,
-	"string":     6,
-	"comment":    7,
-	"inject":     8,
-	"newline":    9,
-	"whitespace": 10,
-	"filler":     0,
-	"pattern":    1,
-	"namedScope": 2,
-	"endblock":   3,
-	"scope":      0,
-}
-
 func injectReplacements(str *string, fillers map[string]string, idMap map[string]map[string]string, scope string) {
 	result := *str
 	for target, rep := range fillers {
@@ -40,6 +21,7 @@ func injectReplacements(str *string, fillers map[string]string, idMap map[string
 }
 
 func Execute(program []*Statement, destFolder string) error {
+	patternIdMapping := map[string]int{}
 	packageName := filepath.Base(destFolder)
 	scopes := []string{}
 	patterns := map[string]map[string]string{}
@@ -47,6 +29,7 @@ func Execute(program []*Statement, destFolder string) error {
 	idReplacements := map[string]map[string]string{}
 	lastScope := ""
 	for _, statement := range program {
+		patternCount := 0
 		scopeName := statement.components[0].components[0].value
 		scopes = append(scopes, scopeName)
 		patterns[scopeName] = map[string]string{}
@@ -85,16 +68,17 @@ func Execute(program []*Statement, destFolder string) error {
 						commandList = append(commandList, command)
 						compIndex++
 					}
+					patternIdMapping[patternName] = patternCount
 					patternIdString := fmt.Sprintf("\\x%02d", patternIdMapping[patternName])
 					idReplacements[scopeName][patternName] = patternIdString
 					patterns[scopeName][patternName] = patternValue
 					commands[scopeName][patternName] = commandList
 					lastKeyName = patternName
+					patternCount++
 				}
 			}
 		}
 		currentTypeName := scopeName
-		// currentPluralTypeName := scopeName + "s"
 		currentAsVariable := strings.ToLower(scopeName)
 		currentAsPluralVariable := currentAsVariable + "s"
 
