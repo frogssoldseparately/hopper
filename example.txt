@@ -1,0 +1,107 @@
+// This is the grammar that describes grammar files for this tool.
+// Rules:
+//      Strings must be enclosed with backticks (` `).
+//      Strings must not contain backticks. Use "\x60" instead.
+//      Indentifiers can only be letters, upper and lower case. No numbers. No symbols.
+//      Whitespace gets removed from pattern strings. If you need spaces, use
+//          escaped hex ("\x20" for space) or escaped characters like "\t".
+//      Patterns may only reference fillers defined in the same block and
+//          patterns of the block directly preceding the one the pattern
+//          lives in. So, expressions can only reference fillers defined in the
+//          "Expression" block, or patterns defined in the "Token" block.
+// 
+// Fillers are variables to be used in patterns. They are copied directly to
+// wherever they are referenced. The format is:
+// 
+//      fillerName = `pattern`
+// 
+// Be wary of typos. A misspelt identifier will not be caught. It will get added
+// to the pattern as is.
+// 
+// Patterns describe what and how things get captured from a parse target file.
+// The format is:
+// 
+//      patternName : `pattern`
+// 
+// You can provide more than one match string for a given pattern using "|" on
+// lines directly following the first match's definition:
+// 
+//      patternName : `pattern`
+//                  | `other pattern`
+//                  | `other other pattern`
+// 
+// You can more finely control how something gets handled after parsing using
+// command lines:
+// 
+//      patternName : `pattern`
+//                  > // go code goes here
+// 
+// The contents of these lines are directly copied to the respective parsers's
+// output code, and is invoked whenever this pattern gets a match. Some commands
+// to keep in mind:
+// 
+//      // For all layers
+//          > ignore = true // this parsed unit does not get added to list
+//          > empty = true // leaves the token's value/component list empty
+//      // For the first parse layer (usually Token)
+//          > value = "something" // overwrites the token's value
+//          > leftTrim = 1 // trims 1 char from the left of the string
+//          > rightTime = 1 // trims 1 char from the right of the string
+//          > bothTrim = 1 // trims 1 char from both ends of the string
+//          > trimChars = "> " // trims trailing and leading ">" and " "
+//          > joinChars = "::" // joins parsed unit components with "::" instead of ""
+//          > parser.incrementLineNumber() // increments parser's line number
+//      // For other layers (Expression, Statement, etc.)
+//          > filters = []int{newlineId} // removes matched newline units from components
+// 
+// A grammar is parsed in layers, with the most granular being first, and the
+// highest set being last. You can have unlimited levels, but here I've only
+// used three - Token, Expression, and Statement. A text file gets parsed using
+// the patterns in the Token block, then those tokens are parsed into expressions
+// by the Expression block, and those expressions into statements by the Statement
+// block. You can have more. You can have fewer.
+// 
+// This is by no means a perfect (or even good) parser generator. I just wanted
+// to make one, so I did. It was enough to generate the code it runs on, but it
+// might not be enough for what you want to do. If you find this lacking, there
+// are much better and more mature tools out there.
+
+Token {
+    // Fillers
+    ANY                 = `.`
+    LETTERS             = `[a-zA-Z]+`
+    NOCAPNEWLINE        = `(?=\n)`
+    SLASHES             = `\/\/`
+
+    // Patterns
+    leftBrace           : `\{`
+    rightBrace          : `\}`
+    equals              : `\=`
+    colon               : `\:`
+    pipe                : `\|`
+    ident               : `LETTERS`
+    string              : `\x60[^\x60]*?\x60`
+                            > bothTrim = 1
+    comment             : `SLASHES ANY*? NOCAPNEWLINE`
+                            > ignore = true
+    inject              : `> ANY*? NOCAPNEWLINE`
+                            > trimChars = "> "
+    newline             : `\n`
+                            > ignore = true
+                            > parser.incrementLineNumber()
+    whitespace          : `\s+`
+                            > ignore = true
+}
+
+Expression {
+    filler              : `ident equals string`
+                            > filters = []int{equalsId}
+    pattern             : `ident colon string (pipe string)* inject*`
+                            > filters = []int{colonId, pipeId}
+    namedScope          : `ident leftBrace`
+    endblock            : `rightBrace`
+}
+
+Statement {
+    scope               : `namedScope (filler|pattern)* endblock`
+}

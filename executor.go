@@ -1,0 +1,307 @@
+package hopper
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+var patternIdMapping = map[string]int{
+	"leftBrace":  0,
+	"rightBrace": 1,
+	"equals":     2,
+	"colon":      3,
+	"pipe":       4,
+	"ident":      5,
+	"string":     6,
+	"comment":    7,
+	"inject":     8,
+	"newline":    9,
+	"whitespace": 10,
+	"filler":     0,
+	"pattern":    1,
+	"namedScope": 2,
+	"endblock":   3,
+	"scope":      0,
+}
+
+func injectReplacements(str *string, fillers map[string]string, idMap map[string]map[string]string, scope string) {
+	result := *str
+	for target, rep := range fillers {
+		result = strings.ReplaceAll(result, target, rep)
+	}
+	if idReps, ok := idMap[scope]; ok {
+		for target, rep := range idReps {
+			result = strings.ReplaceAll(result, target, rep)
+		}
+	}
+	*str = result
+}
+
+func Execute(program []*Statement, destFolder string) error {
+	packageName := filepath.Base(destFolder)
+	scopes := []string{}
+	patterns := map[string]map[string]string{}
+	commands := map[string]map[string][]string{}
+	idReplacements := map[string]map[string]string{}
+	lastScope := ""
+	for _, statement := range program {
+		scopeName := statement.components[0].components[0].value
+		scopes = append(scopes, scopeName)
+		patterns[scopeName] = map[string]string{}
+		commands[scopeName] = map[string][]string{}
+		idReplacements[scopeName] = map[string]string{}
+		fillers := map[string]string{}
+		lastKeyName := ""
+		// skip first and last expressions
+		for i := 1; i < len(statement.components)-1; i++ {
+			exp := statement.components[i]
+			expComps := exp.components
+			switch exp.id {
+			case fillerId:
+				{
+					fillerName := expComps[0].value
+					fillerValue := expComps[1].value
+					fillers[fillerName] = fillerValue
+				}
+			case patternId:
+				{
+					patternName := expComps[0].value
+					patternValue := expComps[1].value
+					injectReplacements(&patternValue, fillers, idReplacements, lastScope)
+					patternValue = "^((" + strings.ReplaceAll(patternValue, " ", "") + "))"
+					compIndex := 2
+					for compIndex < len(expComps) && expComps[compIndex].id == stringId {
+						additionalPattern := expComps[compIndex].value
+						injectReplacements(&additionalPattern, fillers, idReplacements, lastScope)
+						additionalPattern = strings.ReplaceAll(additionalPattern, " ", "")
+						patternValue = patternValue[0:len(patternValue)-1] + "|(" + additionalPattern + "))"
+						compIndex++
+					}
+					commandList := []string{}
+					for compIndex < len(expComps) {
+						command := expComps[compIndex].value
+						commandList = append(commandList, command)
+						compIndex++
+					}
+					patternIdString := fmt.Sprintf("\\x%02d", patternIdMapping[patternName])
+					idReplacements[scopeName][patternName] = patternIdString
+					patterns[scopeName][patternName] = patternValue
+					commands[scopeName][patternName] = commandList
+					lastKeyName = patternName
+				}
+			}
+		}
+		currentTypeName := scopeName
+		// currentPluralTypeName := scopeName + "s"
+		currentAsVariable := strings.ToLower(scopeName)
+		currentAsPluralVariable := currentAsVariable + "s"
+
+		lastTypeName := lastScope
+		lastPluralTypeName := lastScope + "s"
+		lastAsVariable := strings.ToLower(lastScope)
+		lastAsPluralVariable := lastAsVariable + "s"
+		f, err := os.Create(filepath.Join(destFolder, currentAsPluralVariable+".go"))
+		if err != nil {
+			fmt.Println("Oops")
+			continue
+		}
+		fmt.Fprintf(f, "package %s\n\nimport (\n", packageName)
+		if lastTypeName == "" {
+			fmt.Fprintf(f, "\t\"strings\"\n\n")
+		} else {
+			fmt.Fprintf(f, "\t\"slices\"\n\n")
+		}
+		fmt.Fprintf(f, "\t\"github.com/dlclark/regexp2/v2\"\n)\n\n")
+		fmt.Fprintf(f, "type %s struct {\n\tid int\n\t", currentTypeName)
+		if lastTypeName == "" {
+			fmt.Fprintf(f, "value string\n\t")
+		} else {
+			fmt.Fprintf(f, "components []*%s\n\t", lastTypeName)
+		}
+		fmt.Fprintf(f, "line int\n\tcolumn int\n}\n\nconst (\n")
+		for name := range patterns[scopeName] {
+			fmt.Fprintf(f, "\t%sId int = %d\n", name, patternIdMapping[name])
+		}
+		fmt.Fprintf(f, ")\n\nvar %sMatchers = map[int]*regexp2.Regexp{\n", currentAsVariable)
+		for name, value := range patterns[scopeName] {
+			fmt.Fprintf(f, "\t%sId: regexp2.MustCompile(`%s`, regexOptions),\n", name, value)
+		}
+		fmt.Fprintf(f, "}\n\n")
+		if lastTypeName != "" {
+			fmt.Fprintf(f, "func filter%s(%s *[]*%s, filters []int) {\n", lastPluralTypeName, lastAsPluralVariable, lastTypeName)
+			fmt.Fprintf(f, "\treplacement := []*%s{}\n", lastTypeName)
+			fmt.Fprintf(f, "\tfor _, %s := range *%s {\n", lastAsVariable, lastAsPluralVariable)
+			fmt.Fprintf(f, "\t\tif !slices.Contains(filters, %s.id) {\n", lastAsVariable)
+			fmt.Fprintf(f, "\t\t\treplacement = append(replacement, %s)\n", lastAsVariable)
+			fmt.Fprintf(f, "\t\t}\n")
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\t*%s = replacement\n", lastAsPluralVariable)
+			fmt.Fprintf(f, "}\n\n")
+
+			fmt.Fprintf(f, "func (parser *Parser) make%s(id int, components []*%s) *%s {\n", currentTypeName, lastTypeName, currentTypeName)
+			fmt.Fprintf(f, "\tignore := false\n")
+			fmt.Fprintf(f, "\tempty := false\n")
+			fmt.Fprintf(f, "\tvar filters []int\n")
+			fmt.Fprintf(f, "\tline := components[0].line\n")
+			fmt.Fprintf(f, "\tcolumn := components[0].column\n\n")
+		} else {
+			fmt.Fprintf(f, "func (parser *Parser) make%s(id int, components []string) *%s {\n", currentTypeName, currentTypeName)
+			fmt.Fprintf(f, "\tignore := false\n")
+			fmt.Fprintf(f, "\tempty := false\n")
+			fmt.Fprintf(f, "\tvalue := \"\"\n")
+			fmt.Fprintf(f, "\ttrimChars := \"\"\n")
+			fmt.Fprintf(f, "\tjoinChars := \"\"\n")
+			fmt.Fprintf(f, "\tleftTrim := 0\n")
+			fmt.Fprintf(f, "\trightTrim := 0\n")
+			fmt.Fprintf(f, "\tbothTrim := 0\n\n")
+		}
+		fmt.Fprintf(f, "\tswitch id {\n")
+		for name, commands := range commands[scopeName] {
+			if len(commands) == 0 {
+				continue
+			}
+			fmt.Fprintf(f, "\tcase %sId:\n", name)
+			for _, command := range commands {
+				fmt.Fprintf(f, "\t\t%s\n", command)
+			}
+		}
+		fmt.Fprintf(f, "\tdefault:\n\t\t// do nothing\n\t}\n\n")
+		fmt.Fprintf(f, "\tif ignore {\n\t\treturn nil\n\t}\n")
+		if lastTypeName == "" {
+			fmt.Fprintf(f, "\tif !empty && len(value) == 0 {\n")
+			fmt.Fprintf(f, "\t\tvalue = strings.Trim(strings.Join(components, joinChars), trimChars)\n")
+			fmt.Fprintf(f, "\t\tif bothTrim != 0 {\n")
+			fmt.Fprintf(f, "\t\t\tleftTrim = bothTrim\n")
+			fmt.Fprintf(f, "\t\t\trightTrim = bothTrim\n")
+			fmt.Fprintf(f, "\t\t}\n")
+			fmt.Fprintf(f, "\t\tif leftTrim+rightTrim+bothTrim > 0 {\n")
+			fmt.Fprintf(f, "\t\t\tvalue = value[leftTrim : len(value) - rightTrim]\n")
+			fmt.Fprintf(f, "\t\t}\n")
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\treturn &%s{id, value, parser.lineNumber, parser.columnNumber}\n", currentTypeName)
+			fmt.Fprintf(f, "}\n\n")
+
+			fmt.Fprintf(f, "func (parser *Parser) read%s(raw *string) (int, *%s) {\n", currentTypeName, currentTypeName)
+			fmt.Fprintf(f, "\tid := -1\n")
+			fmt.Fprintf(f, "\tmatchLength := -1\n")
+			fmt.Fprintf(f, "\tcomponents := []string{}\n")
+			fmt.Fprintf(f, "\tfor key := 0; key <= %sId; key++ {\n", lastKeyName)
+			fmt.Fprintf(f, "\t\tregex := %sMatchers[key]\n", currentAsVariable)
+			fmt.Fprintf(f, "\t\tif match, _ := regex.FindStringMatch(*raw); match != nil {\n")
+			fmt.Fprintf(f, "\t\t\tid = key\n")
+			fmt.Fprintf(f, "\t\t\tmatchLength = match.RuneLength\n")
+			fmt.Fprintf(f, "\t\t\tfor _, component := range match.Captures {\n")
+			fmt.Fprintf(f, "\t\t\t\tcomponents = append(components, component.String())\n")
+			fmt.Fprintf(f, "\t\t\t}\n")
+			fmt.Fprintf(f, "\t\t\tbreak\n")
+			fmt.Fprintf(f, "\t\t}\n")
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\tif id == -1 {\n")
+			fmt.Fprintf(f, "\t\treturn matchLength, nil\n")
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\treturn matchLength, parser.make%s(id, components)\n", currentTypeName)
+			fmt.Fprintf(f, "}\n")
+		} else {
+			fmt.Fprintf(f, "\tif empty {\n")
+			fmt.Fprintf(f, "\t\tcomponents = []*%s{}\n", lastTypeName)
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\tif len(components) > 0 && len(filters) > 0 {\n")
+			fmt.Fprintf(f, "\t\tfilter%s(&components, filters)\n", lastPluralTypeName)
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\treturn &%s{id, components, line, column}\n", currentTypeName)
+			fmt.Fprintf(f, "}\n\n")
+
+			fmt.Fprintf(f, "func (parser *Parser) read%s(raw *[]rune, %s *[]*%s) (int, *%s) {\n", currentTypeName, lastAsPluralVariable, lastTypeName, currentTypeName)
+			fmt.Fprintf(f, "\tid := -1\n")
+			fmt.Fprintf(f, "\tmatchLength := -1\n")
+			fmt.Fprintf(f, "\tfor key := 0; key <= %sId; key++ {\n", lastKeyName)
+			fmt.Fprintf(f, "\t\tregex := %sMatchers[key]\n", currentAsVariable)
+			fmt.Fprintf(f, "\t\tif match, _ := regex.FindRunesMatch(*raw); match != nil {\n")
+			fmt.Fprintf(f, "\t\t\tid = key\n")
+			fmt.Fprintf(f, "\t\t\tmatchLength = match.RuneLength\n")
+			fmt.Fprintf(f, "\t\t\tbreak\n")
+			fmt.Fprintf(f, "\t\t}\n")
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\tif id == -1 {\n")
+			fmt.Fprintf(f, "\t\treturn matchLength, nil\n")
+			fmt.Fprintf(f, "\t}\n")
+			fmt.Fprintf(f, "\treturn matchLength, parser.make%s(id, (*%s)[0:matchLength])\n", currentTypeName, lastAsPluralVariable)
+			fmt.Fprintf(f, "}\n")
+		}
+		lastScope = scopeName
+		f.Close()
+	}
+
+	f, err := os.Create(filepath.Join(destFolder, "parser.go"))
+	if err != nil {
+		fmt.Println("Oops")
+		return err
+	}
+
+	fmt.Fprintf(f, "package %s\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\t\"strings\"\n\t\"github.com/dlclark/regexp2/v2\"\n)\n\n", packageName)
+	fmt.Fprintf(f, "type Parser struct {\n\tlineNumber int\n\tcolumnNumber int\n}\n\n")
+	fmt.Fprintf(f, "const regexOptions = regexp2.Singleline\n\n")
+	fmt.Fprintf(f, "func MakeParser() *Parser {\n\treturn &Parser{0, 0}\n}\n\n")
+	fmt.Fprintf(f, "func (parser *Parser) incrementLineNumber() {\n")
+	fmt.Fprintf(f, "\tparser.lineNumber++\n")
+	fmt.Fprintf(f, "\tparser.columnNumber = 0\n")
+	fmt.Fprintf(f, "}\n\n")
+	fmt.Fprintf(f, "func (parser *Parser) ParseFile(fileName string) (*[]*%s, error) {\n", lastScope)
+	fmt.Fprintf(f, "\tbuf, err := os.ReadFile(fileName)\n")
+	fmt.Fprintf(f, "\tif err != nil {\n")
+	fmt.Fprintf(f, "\t\treturn nil, fmt.Errorf(\"Could not read %%s : %%s\", fileName, err)\n")
+	fmt.Fprintf(f, "\t}\n")
+	fmt.Fprintf(f, "\traw := strings.ReplaceAll(string(buf), \"\\r\", \"\")\n")
+	for i, scopeName := range scopes {
+		currentTypeName := scopeName
+		currentAsVariable := strings.ToLower(scopeName)
+		currentAsPluralVariable := currentAsVariable + "s"
+		lastTypeName := ""
+		if i != 0 {
+			lastTypeName = scopes[i-1]
+		}
+
+		lastAsVariable := strings.ToLower(lastTypeName)
+		lastAsPluralVariable := lastAsVariable + "s"
+
+		fmt.Fprintf(f, "\tvar %s []*%s\n", currentAsPluralVariable, currentTypeName)
+		if i != len(scopes)-1 {
+			fmt.Fprintf(f, "\t%sRunes := []rune{}\n", currentAsVariable)
+		}
+		if i == 0 {
+			fmt.Fprintf(f, "\tfor len(raw) > 0 {\n")
+			fmt.Fprintf(f, "\t\tdLength, %s := parser.read%s(&raw)\n", currentAsVariable, currentTypeName)
+			fmt.Fprintf(f, "\t\tif dLength == -1 {\n")
+			fmt.Fprintf(f, "\t\t\treturn nil, fmt.Errorf(\"Could not parse token at %%d:%%d\", parser.lineNumber, parser.columnNumber)\n")
+			fmt.Fprintf(f, "\t\t}\n")
+		} else {
+			fmt.Fprintf(f, "\tfor len(%sRunes) > 0 {\n", lastAsVariable)
+			fmt.Fprintf(f, "\t\tdLength, %s := parser.read%s(&%sRunes, &%s)\n", currentAsVariable, currentTypeName, lastAsVariable, lastAsPluralVariable)
+			fmt.Fprintf(f, "\t\tif dLength == -1 {\n")
+			fmt.Fprintf(f, "\t\t\treturn nil, fmt.Errorf(\"Could not parse %s at %%d:%%d\", %s[0].line, %s[0].column)\n", currentAsVariable, lastAsPluralVariable, lastAsPluralVariable)
+			fmt.Fprintf(f, "\t\t}\n")
+		}
+		fmt.Fprintf(f, "\t\tif %s != nil {\n", currentAsVariable)
+		fmt.Fprintf(f, "\t\t\t%s = append(%s, %s)\n", currentAsPluralVariable, currentAsPluralVariable, currentAsVariable)
+		if i != len(scopes)-1 {
+			fmt.Fprintf(f, "\t\t\t%sRunes = append(%sRunes, rune(%s.id))\n", currentAsVariable, currentAsVariable, currentAsVariable)
+		}
+		fmt.Fprintf(f, "\t\t}\n")
+		if i == 0 {
+			fmt.Fprintf(f, "\t\traw = raw[dLength:]\n")
+			fmt.Fprintf(f, "\t\tparser.columnNumber += dLength")
+		} else {
+			fmt.Fprintf(f, "\t\t%sRunes = %sRunes[dLength:]\n", lastAsVariable, lastAsVariable)
+			fmt.Fprintf(f, "\t\t%s = %s[dLength:]\n", lastAsPluralVariable, lastAsPluralVariable)
+		}
+		fmt.Fprintf(f, "\t}\n")
+		if i == len(scopes)-1 {
+			fmt.Fprintf(f, "\treturn &%s, nil\n", currentAsPluralVariable)
+		}
+	}
+	fmt.Fprintf(f, "}\n")
+	f.Close()
+	return nil
+}
